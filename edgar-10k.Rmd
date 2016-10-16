@@ -1,0 +1,169 @@
+---
+title: "PEabody Text Analysis"
+author: "Tricia Jamison"
+date: "June 29, 2016"
+output: pdf_document
+---
+
+
+```{r}
+
+Sys.getlocale()
+Sys.setlocale('LC_ALL','C') 
+
+library(data.table)
+library(plyr)
+library(dplyr)
+library(stringr)
+library(tm)
+library(SnowballC)
+
+raw.dest <- "raw-10K/"
+
+# #############################################################################
+# Downlaod the 10Ks we want
+
+# ##
+# 1) get search results page 
+
+cik <- "0000320193" # Apple
+cik <- "0000789019" # Microsoft
+
+index.page <- paste("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=",cik,"&type=10-K&dateb=&owner=include&count=20",sep="")
+download.file(index.page, destfile = paste(raw.dest, cik,"-index.html", sep=""))
+
+# parse the downloaded index page to get the actual filename of each filing. Each filing has an "accension number" (acc.no)
+doc = htmlParse(paste(raw.dest, cik,"-index.html", sep=""))
+# there is one filing in each row - just grab the whole line of text
+filing.rows <- xpathSApply(doc, "//tr", xmlValue)
+# for now, don't use amended ones - just ignore 13F-HRA
+filing.rows <- grep("10-K\n", filing.rows, value=TRUE)
+
+
+
+# ##
+# 2 and 3) loop through list of filings, parse filenames, download files, return data frame with summary info
+
+# URL format for retrieving filings uses CIK code with no leading zeros
+cik <- gsub("^[0]*","", cik)
+# substr(cik,4,10)
+
+filings <- data.frame(rbindlist(lapply(filing.rows, function(x) {
+  
+  # messy parsing of accension number, file date from each line of text
+  acc.no.dashes <- substr(unlist(strsplit(x, "Acc-no: "))[2],0,20) # accension number with dashes
+  #print(acc.no.dashes)
+  acc.no <- gsub("[^0-9]","",acc.no.dashes) # accension number no dashes
+  #print(acc.no)
+  file.date <- str_trim(unlist(strsplit(x, "\n"))[4])
+  
+  # make url to download filing
+  remote.page <- paste("https://www.sec.gov/Archives/edgar/data/",cik,"/",acc.no,"/",acc.no.dashes,".txt",sep="")
+  # what we save it as locally
+  local.page <- paste(raw.dest, cik, "-", file.date, "-",acc.no, ".txt", sep="")
+
+  if (!file.exists(remote.page)) download.file(remote.page, destfile = local.page)
+  
+  return(data.frame(cik, acc.no, acc.no.dashes, file.date,local.page, remote.page))
+})),stringsAsFactors=FALSE)
+
+# want info as characters, not factors
+filings$local.page <- as.character(filings$local.page)
+filings$remote.page <- as.character(filings$remote.page)
+filings$cik <- as.character(filings$cik)
+filings$acc.no <- as.character(filings$acc.no)
+filings$acc.no.dashes <- as.character(filings$acc.no.dashes)
+filings$file.date <- as.Date(as.character(filings$file.date))
+
+# only keep filings after 2Q 2013 -- filings before this are in unstructured html
+filings <- filings[filings$file.date > as.Date("2007-01-01"),]
+
+
+# #############################################################################
+# Do work on each filing
+
+# https://rstudio-pubs-static.s3.amazonaws.com/31867_8236987cf0a8444e962ccd2aec46d9c3.html#clustering-by-term-similarity
+
+#in.files <- DirSource(raw.dest)$filelist
+#raw.files <- list.files(raw.dest, full.names=TRUE)
+#years <- as.character(c(2016:2040))
+
+out <- data.frame(rbindlist(lapply(1:nrow(filings), function(x) {
+  f <- readLines(filings[x, "local.page"])
+  docs.start <- grep("<DOCUMENT>", f)
+  docs.end <- grep("</DOCUMENT>", f)
+  doc <- f[grep("<DOCUMENT>", f)[1]:grep("</DOCUMENT>", f)[1]]
+  
+  writeLines(doc, paste(filings[x, "local.page"],"-10K.txt",sep=""))
+  
+  words <- strsplit(doc, "\\W+")
+  years <- table(grep("20[012345]+[0-9]+", unlist(words), value=TRUE))
+  years <- as.data.frame.table(years, stringsAsFactors = FALSE)
+  years <- years[which(nchar(years[,1]) == 4),]
+  years$cik = filings[x,"cik"]
+  years$date = filings[x,"file.date"]
+  names(years) <- c("year", "count", "cik","filing.date")
+  #by.lines <- grep("20[012345]+[0-9]+", f, value=TRUE)
+  #by.words <- unlist(strsplit(by.lines, "\\W+"))
+  #years <- grep("20[012345]+[0-9]+", by.words, value=TRUE)
+  #return(data.frame(names(years), years))
+  years
+})))
+
+out$year.date <- paste(out$year, "-01-01", sep="")
+out$year.date <- as.Date(out$year.date)
+
+library(ggplot2)
+library(RColorBrewer)
+
+colourCount = length(unique(out$filing.date))
+getPalette = colorRampPalette(brewer.pal(9, "Blues"))
+
+ggplot(out, aes(x=year.date, y=count, fill=factor(filing.date))) +
+#  scale_fill_brewer() + 
+  scale_fill_manual(values = getPalette(colourCount)) +
+  scale_x_date() +
+  geom_bar(stat="identity")
+
+
+# #############################################################################
+# Do work on whole corpus
+
+er <- VCorpus(DirSource(raw.dest, encoding = "UTF-8"))
+
+er2 <- tm_map(er, removePunctuation)  
+#er2 <- tm_map(er2, removeNumbers)  
+er2 <- tm_map(er2, tolower)  
+er2 <- tm_map(er2, removeWords, stopwords("english"))   
+#er3 <- tm_map(er2, stemDocument)  
+er3 <- tm_map(er2, stripWhitespace)   
+er4 <- tm_map(er3, PlainTextDocument)   
+er4 <- er3
+
+i <- 0
+er4 <- tm_map(er3, function(x) {
+  i <<- i + 1
+  meta(x, tag="id", type="local") <- in.files[i]
+  #meta(x, tag="id") <- in.files[i]
+  print(i)
+  x
+})
+
+(er[[1]])$meta
+(er[[2]])$meta
+
+dtm <- DocumentTermMatrix(er4)   
+inspect(dtm[, c("gas","natgas","environment","shale", "weather","winter","summer")]) 
+inspect(dtm[, grep("subst", dimnames(dtm)$Terms)]) 
+inspect(dtm[, grep("inventor", dimnames(dtm)$Terms)]) 
+
+years <- as.character(c(2015:2030))
+dtm <- DocumentTermMatrix(er)   
+inspect(dtm[,years])
+
+f <- readLines(in.files[1])
+grep("201[0-9]+", f, value=TRUE)
+
+```
+
+
